@@ -109,9 +109,9 @@ pub struct Connection {
 #[derive(Debug, Clone)]
 pub enum ConnectionState {
     Handshake,
-    // Connected,
-    // Publishing,
-    // Playing,
+    Connected,
+    Publishing,
+    Playing,
 }
 
 pub struct StreamManager {
