@@ -1,12 +1,12 @@
 use anyhow::Result;
-use std::sync::Arc;
 use clap::Parser;
-use tokio::net::TcpListener;
-use tracing::{info, error};
+use std::{collections::HashMap, sync::Arc};
+use tokio::{net::TcpListener, sync::RwLock};
+use tracing::{error, info};
 
 mod server {
-    pub mod rtmp;
     pub mod connection;
+    pub mod rtmp;
     pub mod stream;
 }
 
@@ -20,43 +20,36 @@ mod helpers {
     pub mod session;
 }
 
-
-use crate::utils::{
-    types::{
-        Config,
-        Args,
-        RtmpServer,
-    },
-};
-
-
+use crate::utils::types::{Args, Config, RtmpServer, StreamManager};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
-    
+
     let args = Args::parse();
-    
+
     // Load configuration
     let config = Config::load(&args.config).unwrap_or_default();
-    
+
     // Create server
     let server = Arc::new(RtmpServer::new(config));
-    
+
     // Bind to address
     let listener = TcpListener::bind(&args.bind).await?;
     info!("RTMP Server listening on {}", args.bind);
-    
+
     // Accept connections
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 info!("New connection from {}", addr);
                 let server_clone = Arc::clone(&server);
-                
+                let stream_manager = Arc::new(RwLock::new(StreamManager {
+                    streams: HashMap::new(),
+                }));
                 tokio::spawn(async move {
-                    if let Err(e) = server_clone.handle_connection(stream, addr).await {
+                    if let Err(e) = server_clone.handle_connection(stream, addr, stream_manager).await {
                         error!("Connection error: {}", e);
                     }
                 });

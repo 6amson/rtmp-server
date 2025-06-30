@@ -5,19 +5,21 @@ use crate::utils::types::{StreamManager, Stream};
 
 impl StreamManager {
     pub fn new() -> Self {
-        Self {
-            streams: HashMap::new(),
-        }
+        Self { streams: HashMap::new() }
     }
-    
-    pub fn create_stream(&mut self, key: String) -> broadcast::Receiver<Vec<u8>> {
-        let (tx, rx) = broadcast::channel(1024);
-        let stream = Stream {
-            key: key.clone(),
-            sender: tx,
-            receiver_count: 0,
-        };
-        self.streams.insert(key, stream);
-        rx
+
+    pub fn get_or_create(&mut self, key: &str) -> &mut Stream {
+        self.streams
+            .entry(key.to_string())
+            .or_insert_with(|| Stream {
+                key: key.to_string(),
+                sender: broadcast::channel(100).0,
+                receiver_count: 0,
+            })
     }
+
+    pub fn get(&self, key: &str) -> Option<&Stream> {
+        self.streams.get(key)
+    }
+
 }

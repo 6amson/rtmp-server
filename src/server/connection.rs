@@ -2,20 +2,31 @@ use crate::utils::error::RtmpError;
 use crate::utils::types::*;
 use bytes::BytesMut;
 use rand::{thread_rng, RngCore};
+use rml_amf0::{serialize, Amf0Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::{broadcast, Mutex};
+use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 impl Connection {
-    pub fn new(stream: TcpStream, addr: SocketAddr, config: Config) -> Self {
+    pub fn new(
+        stream: TcpStream,
+        addr: SocketAddr,
+        config: Config,
+        stream_manager: Arc<RwLock<StreamManager>>,
+    ) -> Self {
         Self {
-            stream,
+            stream: Arc::new(Mutex::new(stream)),
             addr,
             config,
             state: ConnectionState::Handshake,
+            session: None,
+            stream_manager,
         }
     }
 
@@ -27,15 +38,21 @@ impl Connection {
 
         // Main message loop
         loop {
-            let mut buf = vec![0u8; self.config.chunk_size + 1];
-            match self.stream.read_exact(&mut buf).await {
-                Ok(_) => {
-                    // Process chunk
-                    self.process_chunk(&buf).await?;
-                }
-                Err(e) => {
-                    debug!("Connection {} ended: {}", self.addr, e);
-                    break;
+            {
+                let mut buf = vec![0u8; self.config.chunk_size + 1];
+                let read_result = {
+                    let mut stream = self.stream.lock().await;
+                    stream.read_exact(&mut buf).await
+                };
+                match read_result {
+                    Ok(_) => {
+                        // Process chunk
+                        self.process_chunk(&buf).await?;
+                    }
+                    Err(e) => {
+                        debug!("Connection {} ended: {}", self.addr, e);
+                        break;
+                    }
                 }
             }
         }
@@ -49,7 +66,17 @@ impl Connection {
         // === C0 + C1 ===
         // Read C0 (1 byte version) + C1 (1536 bytes timestamp + random)
         let mut c0_c1 = vec![0u8; 1 + RTMP_HANDSHAKE_SIZE];
-        self.stream.read_exact(&mut c0_c1).await?;
+        let read_result = {
+            let mut stream = self.stream.lock().await;
+            stream.read_exact(&mut c0_c1).await
+        };
+        match read_result {
+            Ok(_) => {}
+            Err(e) => {
+                debug!("Connection {} ended: {}", self.addr, e);
+                return Err(e.into());
+            }
+        }
 
         let version = c0_c1[0];
         if version != RTMP_VERSION {
@@ -59,7 +86,7 @@ impl Connection {
             )));
         }
 
-        let c1 = &c0_c1[1..];
+        let c1 = &mut c0_c1[1..];
         debug!("Received C0 (version: {}) and C1", version);
 
         // === S0 + S1 ===
@@ -77,19 +104,31 @@ impl Connection {
         s0_s1[5..9].fill(0); // Zero padding
         rand::thread_rng().fill_bytes(&mut s0_s1[9..]);
 
-        self.stream.write_all(&s0_s1).await?;
+        {
+            let mut stream = self.stream.lock().await;
+            stream.write_all(&mut &s0_s1).await;
         debug!("Sent S0 + S1");
+        };
 
         // === C2 ===
         // Read C2 (1536 bytes - should echo our S1)
+        let _read_result = {
         let mut c2 = vec![0u8; RTMP_HANDSHAKE_SIZE];
-        self.stream.read_exact(&mut c2).await?;
+        let mut stream = self.stream.lock().await;
+        stream.read_exact(&mut c2).await?;
         debug!("Received C2");
+        };
+
 
         // === S2 ===
         // Send S2 (echo C1)
-        self.stream.write_all(c1).await?;
+        let _write_all_result = {
+            let mut stream = self.stream.lock().await;
+            stream.write_all(&c1).await?;
+
         debug!("Sent S2 - handshake complete!");
+        };
+
 
         // Update connection state
         self.state = ConnectionState::Connected;
@@ -133,7 +172,6 @@ impl Connection {
             MessageType::WindowAckSize => self.handle_window_ack_size(payload).await?,
             MessageType::SetPeerBandwidth => self.handle_set_peer_bandwidth(payload).await?,
             MessageType::CommandAmf0 => self.handle_command_amf0(payload).await?,
-            MessageType::DataAmf0 => self.handle_data_amf0(payload).await?,
             MessageType::Audio => self.handle_audio(payload).await?,
             MessageType::Video => self.handle_video(payload).await?,
             _ => {
@@ -155,7 +193,7 @@ impl Connection {
                 0
             }
         }
-    } 
+    }
 
     fn parse_chunk_header(&self, data: &[u8]) -> Result<ChunkHeader> {
         if data.is_empty() {
@@ -299,49 +337,204 @@ impl Connection {
     }
 
     async fn handle_command_amf0(&mut self, payload: &[u8]) -> Result<()> {
-        debug!(
-            "Received AMF0 command ({} bytes) - parsing needed",
-            payload.len()
-        );
-        // TODO: Parse AMF0 data to extract command name (connect, publish, play, etc.)
-        // For now, just log that we received it
+        debug!("Parsing AMF0 command");
 
-        // Basic check for "connect" command (simplified)
-        if payload.len() > 7 {
-            let connect_bytes = b"connect";
-            if payload[1..8] == *connect_bytes {
-                info!("Client connecting - should send connect response");
-                self.send_connect_response().await?;
+        let values = rml_amf0::deserialize(&mut &payload[..])
+            .map_err(|e| RtmpError::Amf0(format!("AMF0 deserialization error: {:?}", e)))?;
+
+        if values.is_empty() {
+            return Err(RtmpError::Protocol("Empty AMF0 command".into()));
+        }
+
+        if let Amf0Value::Utf8String(command) = &values[0] {
+            match command.as_str() {
+                "connect" => {
+                    info!("Received connect command");
+                    self.send_connect_response().await?;
+                }
+                "createStream" => {
+                    info!("Received createStream command");
+                    self.send_create_stream_response().await?;
+                }
+                "publish" => {
+                    if let Some(Amf0Value::Utf8String(stream_key)) = values.get(3) {
+                        info!("Client wants to publish to stream: {}", stream_key);
+                        self.register_publisher(stream_key.clone()).await?;
+                    }
+                }
+                "play" => {
+                    if let Some(Amf0Value::Utf8String(stream_key)) = values.get(3) {
+                        info!("Client wants to play stream: {}", stream_key);
+                        self.register_viewer(stream_key.clone()).await?;
+                    }
+                }
+                _ => {
+                    debug!("Unhandled AMF0 command: {}", command);
+                }
             }
         }
 
         Ok(())
     }
 
-    async fn handle_data_amf0(&mut self, payload: &[u8]) -> Result<()> {
-        debug!("Received AMF0 data ({} bytes)", payload.len());
-        // TODO: Parse metadata, stream info, etc.
-        Ok(())
+    async fn send_create_stream_response(&mut self) -> Result<()> {
+    let response = vec![
+        Amf0Value::Utf8String("_result".into()),
+        Amf0Value::Number(2.0), // Transaction ID
+        Amf0Value::Null,        // No properties
+        Amf0Value::Number(1.0), // Stream ID (1)
+    ];
+
+    let data = serialize(&response)
+        .map_err(|e| RtmpError::Amf0(format!("serialize error: {:?}", e)))?;
+
+    let mut stream = self.stream.lock().await;
+    stream.write_all(&data).await?;
+
+    Ok(())
     }
 
+
+    async fn send_connect_response(&mut self) -> Result<()> {
+
+    let props = Amf0Value::Object(vec![
+        ("fmsVer".to_string(), Amf0Value::Utf8String("FMS/3,5,7,7009".into())),
+        ("capabilities".to_string(), Amf0Value::Number(31.0)),
+    ].iter()
+    .map(|(k, v)| (k.to_string(), match v {
+        Amf0Value::Utf8String(s) => Amf0Value::Utf8String(s.into()),
+        Amf0Value::Number(n) => Amf0Value::Number(*n),
+        _ => Amf0Value::Null,
+    }))
+    .collect::<HashMap<_, _>>( )
+    );
+
+    let info = Amf0Value::Object(
+        vec![
+            ("level".to_string(), Amf0Value::Utf8String("status".into())),
+            ("code".to_string(), Amf0Value::Utf8String("NetConnection.Connect.Success".into())),
+            ("description".to_string(), Amf0Value::Utf8String("Connection succeeded.".into()))
+        ].iter()
+        .map(|(k, v)| (k.to_string(), match v {
+            Amf0Value::Utf8String(s) => Amf0Value::Utf8String(s.into()),
+            Amf0Value::Number(n) => Amf0Value::Number(*n),
+            _ => Amf0Value::Null,
+        }))
+        .collect::<HashMap<_, _>>( )
+    );
+
+    let response = vec![
+        Amf0Value::Utf8String("_result".into()),
+        Amf0Value::Number(1.0),
+        props,
+        info,
+    ];
+
+    let data = serialize(&response)
+        .map_err(|e| RtmpError::Amf0(format!("serialize error: {:?}", e)))?;
+
+    let mut stream = self.stream.lock().await;
+    stream.write_all(&data).await?;
+
+    Ok(())
+    }
+
+
+
+
     async fn handle_audio(&mut self, payload: &[u8]) -> Result<()> {
-        debug!("Received audio data ({} bytes)", payload.len());
-        // TODO: Forward to viewers, save to file, etc.
-        self.state = ConnectionState::Publishing;
+        if let Some(Session {
+            stream_key: Some(key),
+            role: Some(Role::Publisher),
+            ..
+        }) = &self.session
+        {
+            let manager = self.stream_manager.read().await;
+            if let Some(stream) = manager.streams.get(key) {
+                let _ = stream.sender.send(payload.to_vec());
+            }
+        }
+
         Ok(())
     }
 
     async fn handle_video(&mut self, payload: &[u8]) -> Result<()> {
-        debug!("Received video data ({} bytes)", payload.len());
-        // TODO: Forward to viewers, save to file, etc.
-        self.state = ConnectionState::Publishing;
+        if let Some(Session {
+            stream_key: Some(key),
+            role: Some(Role::Publisher),
+            ..
+        }) = &self.session
+        {
+            let manager = self.stream_manager.read().await;
+            if let Some(stream) = manager.streams.get(key) {
+                let _ = stream.sender.send(payload.to_vec());
+            }
+        }
+
         Ok(())
     }
 
-    async fn send_connect_response(&mut self) -> Result<()> {
-        debug!("Sending connect response");
-        // TODO: Build proper AMF0 response
-        // For now, just acknowledge we received the connect
+    async fn register_publisher(&mut self, key: String) -> Result<()> {
+        let mut manager = self.stream_manager.write().await;
+
+        // Insert or get stream
+        let entry = manager.streams.entry(key.clone()).or_insert_with(|| {
+            let (sender, _) = broadcast::channel(100);
+            Stream {
+                key: key.clone(),
+                sender,
+                receiver_count: 0,
+            }
+        });
+
+        self.session = Some(Session {
+            addr: self.addr,
+            stream_key: Some(key.clone()),
+            role: Some(Role::Publisher),
+        });
+
+        self.state = ConnectionState::Publishing;
+        info!("Registered {} as publisher for stream {}", self.addr, key);
+
+        Ok(())
+    }
+
+    async fn register_viewer(&mut self, key: String) -> Result<()> {
+        let mut manager = self.stream_manager.write().await;
+
+        let entry = manager.streams.entry(key.clone()).or_insert_with(|| {
+            let (sender, _) = broadcast::channel(100);
+            Stream {
+                key: key.clone(),
+                sender,
+                receiver_count: 0,
+            }
+        });
+
+        entry.receiver_count += 1;
+        let mut receiver = entry.sender.subscribe();
+
+        let writer = Arc::clone(&self.stream);
+
+        tokio::spawn(async move {
+            while let Ok(chunk) = receiver.recv().await {
+                let mut stream = writer.lock().await;
+                if let Err(e) = stream.write_all(&chunk).await {
+                    tracing::error!("Failed to write to viewer: {}", e);
+                    break;
+                }
+            }
+        });
+
+        self.session = Some(Session {
+            addr: self.addr,
+            stream_key: Some(key.clone()),
+            role: Some(Role::Viewer),
+        });
+
+        self.state = ConnectionState::Playing;
+        info!("Viewer {} subscribed to {}", self.addr, key);
+
         Ok(())
     }
 }

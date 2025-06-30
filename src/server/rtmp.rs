@@ -1,4 +1,4 @@
-use crate::utils::types::{Config, Connection, Result, RtmpServer,};
+use crate::utils::types::{Config, Connection, Result, RtmpServer, StreamManager,};
 use crate::utils::error::RtmpError;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -11,12 +11,17 @@ impl RtmpServer {
         Self {
             config,
             connections: Arc::new(RwLock::new(HashMap::new())),
-            streams: Arc::new(RwLock::new(HashMap::new())),
+            stream_manager: Arc::new(RwLock::new(StreamManager::new())),
         }
     }
 
-    pub async fn handle_connection(&self, stream: TcpStream, addr: SocketAddr) -> Result<()> {
-        let connection = Arc::new(Connection::new(stream, addr, self.config.clone()));
+    pub async fn handle_connection(
+        &self,
+        stream: TcpStream,
+        addr: SocketAddr,
+        stream_manager: Arc<RwLock<StreamManager>>,
+    ) -> Result<()> {
+        let connection = Arc::new(Connection::new(stream, addr, self.config.clone(), stream_manager));
 
         // Add to connections
         {

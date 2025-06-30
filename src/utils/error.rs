@@ -19,4 +19,7 @@ pub enum RtmpError {
     
     #[error("Stream not found: {0}")]
     StreamNotFound(String),
+
+    #[error("AMF0 error: {0}")]
+    Amf0(String),
 }

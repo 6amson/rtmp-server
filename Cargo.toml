@@ -12,6 +12,7 @@ repository = "https://github.com/6amson/rtmp-server"
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 rand = "0.8"
+rml_amf0 = "0.1"
 
 # Networking
 bytes = "1.5"

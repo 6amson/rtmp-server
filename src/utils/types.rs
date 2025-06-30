@@ -1,13 +1,13 @@
 use crate::utils::error::RtmpError;
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
 use tokio::sync::broadcast;
-
+use tokio::sync::RwLock;
 
 #[derive(Parser)]
 #[command(name = "rtmp-server")]
@@ -30,16 +30,16 @@ pub struct Config {
     pub stream_timeout: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct StreamInfo {
-    pub stream_key: String,
-    pub publisher: Option<SocketAddr>,
-    pub viewers: Vec<SocketAddr>,
-}
+// #[derive(Debug, Clone)]
+// pub struct StreamInfo {
+//     pub stream_key: String,
+//     pub publisher: Option<SocketAddr>,
+//     pub viewers: Vec<SocketAddr>,
+// }
 pub struct RtmpServer {
     pub config: Config,
     pub connections: Arc<RwLock<HashMap<SocketAddr, Arc<Connection>>>>,
-    pub streams: Arc<RwLock<HashMap<String, StreamInfo>>>,
+    pub stream_manager: Arc<RwLock<StreamManager>>,
 }
 
 pub const RTMP_VERSION: u8 = 3;
@@ -47,7 +47,7 @@ pub const RTMP_HANDSHAKE_SIZE: usize = 1536;
 
 impl TryFrom<u8> for MessageType {
     type Error = RtmpError;
-    
+
     fn try_from(value: u8) -> Result<Self> {
         match value {
             1 => Ok(MessageType::SetChunkSize),
@@ -65,7 +65,10 @@ impl TryFrom<u8> for MessageType {
             19 => Ok(MessageType::SharedObjectAmf0),
             20 => Ok(MessageType::CommandAmf0),
             22 => Ok(MessageType::Aggregate),
-            _ => Err(RtmpError::Protocol(format!("Unknown message type: {}", value))),
+            _ => Err(RtmpError::Protocol(format!(
+                "Unknown message type: {}",
+                value
+            ))),
         }
     }
 }
@@ -100,10 +103,12 @@ pub struct ChunkHeader {
 }
 
 pub struct Connection {
-    pub stream: TcpStream,
+    pub stream: Arc<Mutex<TcpStream>>,
     pub addr: SocketAddr,
     pub config: Config,
     pub state: ConnectionState,
+    pub session: Option<Session>,
+    pub stream_manager: Arc<RwLock<StreamManager>>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,11 +120,24 @@ pub enum ConnectionState {
 }
 
 pub struct StreamManager {
-   pub streams: HashMap<String, Stream>,
+    pub streams: HashMap<String, Stream>,
 }
 
 pub struct Stream {
     pub key: String,
     pub sender: broadcast::Sender<Vec<u8>>,
     pub receiver_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Role {
+    Publisher,
+    Viewer,
+}
+
+#[derive(Debug)]
+pub struct Session {
+    pub addr: SocketAddr,
+    pub stream_key: Option<String>,
+    pub role: Option<Role>,
 }
