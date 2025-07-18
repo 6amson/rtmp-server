@@ -1,10 +1,11 @@
-use crate::utils::types::{Config, Connection, Result, RtmpServer, StreamManager,};
 use crate::utils::error::RtmpError;
+use crate::utils::types::{Config, Connection, Result, RtmpServer, StreamManager};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::{RwLock};
+use tokio::sync::RwLock;
+use tracing::{error};
 
 impl RtmpServer {
     pub fn new(config: Config) -> Self {
@@ -21,7 +22,12 @@ impl RtmpServer {
         addr: SocketAddr,
         stream_manager: Arc<RwLock<StreamManager>>,
     ) -> Result<()> {
-        let connection = Arc::new(Connection::new(stream, addr, self.config.clone(), stream_manager));
+        let connection = Arc::new(Connection::new(
+            stream,
+            addr,
+            self.config.clone(),
+            stream_manager,
+        ));
 
         // Add to connections
         {
@@ -36,8 +42,13 @@ impl RtmpServer {
         };
 
         // Handle the connection
-        let connection = Arc::try_unwrap(connection)
-            .map_err(|_| RtmpError::Protocol("Failed to take connection ownership".to_string()))?;
+        // let connection = Arc::try_unwrap(connection).map_err(|arc| {
+        //     error!(
+        //         "Failed to take ownership of Connection Arc (strong_count = {})",
+        //         Arc::strong_count(&arc)
+        //     );
+        //     RtmpError::Protocol("Failed to take connection ownership".to_string())
+        // })?;
 
         connection.handle().await
     }

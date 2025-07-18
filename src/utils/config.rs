@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+// use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::fs;
 
 use crate::utils::types::Config;
@@ -6,7 +8,7 @@ use crate::utils::types::Config;
 impl Default for Config {
     fn default() -> Self {
         Self {
-            chunk_size: 1536,
+            chunk_size: Arc::new(Mutex::new(1536)),
             max_connections: 1000,
             handshake_timeout: 5000, // ms
             stream_timeout: 30000,   // ms

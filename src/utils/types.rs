@@ -24,7 +24,8 @@ pub type Result<T> = std::result::Result<T, RtmpError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub chunk_size: usize,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub chunk_size: Arc<Mutex<usize>>,
     pub max_connections: usize,
     pub handshake_timeout: u64,
     pub stream_timeout: u64,
@@ -106,8 +107,8 @@ pub struct Connection {
     pub stream: Arc<Mutex<TcpStream>>,
     pub addr: SocketAddr,
     pub config: Config,
-    pub state: ConnectionState,
-    pub session: Option<Session>,
+    pub state: Arc<Mutex<ConnectionState>>,
+    pub session: Arc<Mutex<Option<Session>>>,
     pub stream_manager: Arc<RwLock<StreamManager>>,
 }
 
