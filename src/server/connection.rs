@@ -1,12 +1,12 @@
 use crate::utils::error::*;
 use crate::utils::types::*;
 // use bytes::BytesMut;
-use rand::{thread_rng, RngCore};
+// use rand::{thread_rng, RngCore};
 use rml_amf0::{serialize, Amf0Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
-use std::time;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -27,6 +27,7 @@ impl Connection {
             state: Arc::new(Mutex::new(ConnectionState::Handshake)),
             session: Arc::new(Mutex::new(None)),
             stream_manager,
+            next_stream_id: AtomicU32::new(1),
         }
     }
 
@@ -47,7 +48,7 @@ impl Connection {
 
         loop {
             let chunk_conn = Arc::clone(&conn); // only for processing
-            let log_conn = Arc::clone(&conn); // preserved for logging after .await
+            let log_conn = Arc::clone(&conn); // preserved for logging
 
             match chunk_conn
                 .read_and_process_chunk(&mut chunk_buffers, &mut chunk_headers)
@@ -126,12 +127,9 @@ impl Connection {
 
         // Parse the complete header
         let self_clone = Arc::clone(&self);
-        // self_clone.process_message(&header, &complete_message).await?;
-
         let header = self_clone.parse_chunk_header(&header_data, chunk_headers)?;
 
         // Check for extended timestamp
-        let mut extended_timestamp_bytes = 0;
         if (format == 0 || format == 1 || format == 2)
             && (header.timestamp == 0xFFFFFF || header.timestamp >= 0xFFFFFF)
         {
@@ -141,22 +139,7 @@ impl Connection {
                 stream.read_exact(&mut ext_timestamp).await?;
             }
             header_data.extend_from_slice(&ext_timestamp);
-            extended_timestamp_bytes = 4;
         }
-
-        // let self_clone = Arc::clone(self);
-
-        // if (format == 0 || format == 1 || format == 2)
-        //     && (header.timestamp == 0xFFFFFF || header.timestamp >= 0xFFFFFF)
-        // {
-        //     let mut ext_timestamp = vec![0u8; 4];
-        //     {
-        //         let mut stream = self_clone.stream.lock().await;
-        //         stream.read_exact(&mut ext_timestamp).await?;
-        //     }
-        //     header_data.extend_from_slice(&ext_timestamp);
-        //     extended_timestamp_bytes = 4;
-        // }
 
         // Store header for future type 1,2,3 chunks
         chunk_headers.insert(chunk_stream_id, header.clone());
@@ -173,6 +156,11 @@ impl Connection {
         let chunk_size = *self.config.chunk_size.lock().await;
         let payload_size = std::cmp::min(remaining_in_message, chunk_size);
 
+        debug!(
+            "Chunk: stream_id={}, format={}, remaining={}, chunk_size={}, payload_size={}",
+            chunk_stream_id, format, remaining_in_message, chunk_size, payload_size
+        );
+
         // Read payload
         let mut payload = vec![0u8; payload_size];
         if payload_size > 0 {
@@ -184,17 +172,45 @@ impl Connection {
         let buffer = chunk_buffers.entry(chunk_stream_id).or_default();
         buffer.extend_from_slice(&payload);
 
+        debug!(
+            "Buffer state: stream_id={}, buffer_len={}, expected_len={}",
+            chunk_stream_id,
+            buffer.len(),
+            header.message_length
+        );
+
         // Check if we have a complete message
         if buffer.len() >= header.message_length as usize {
-            let complete_message = buffer.split_off(0); // Take complete message, reset buffer
-
+            // CRITICAL FIX: Take only the exact message length, not the entire buffer
+            debug!("Pre-reassembly state:");
+            debug!("  Buffer length: {}", buffer.len());
+            debug!("  Expected message length: {}", header.message_length);
             debug!(
-                "Complete message: stream_id={}, type={}, length={}, payload={}bytes",
-                chunk_stream_id,
-                header.message_type,
-                header.message_length,
-                complete_message.len()
+                "  Buffer content (first 50 bytes): {:?}",
+                &buffer[..std::cmp::min(50, buffer.len())]
             );
+            let message_len = header.message_length as usize;
+            let complete_message = buffer.drain(..message_len).collect::<Vec<u8>>();
+
+            // Keep any remaining bytes for the next message
+            debug!(
+            "Complete message: stream_id={}, type={}, length={}, payload={}bytes, remaining_in_buffer={}",
+            chunk_stream_id,
+            header.message_type,
+            header.message_length,
+            complete_message.len(),
+            buffer.len()
+        );
+
+            // Validate message length
+            if complete_message.len() != header.message_length as usize {
+                error!(
+                    "Message length mismatch: expected={}, actual={}",
+                    header.message_length,
+                    complete_message.len()
+                );
+                return Err(RtmpError::Protocol("Message length mismatch".into()));
+            }
 
             // Process the complete message
             let self_clone = Arc::clone(&self);
@@ -442,6 +458,12 @@ impl Connection {
             MessageType::CommandAmf0 => self.handle_command_amf0(payload).await?,
             MessageType::Audio => self.handle_audio(payload).await?,
             MessageType::Video => self.handle_video(payload).await?,
+            MessageType::CommandAmf3 => self.handle_command_amf3(payload).await?, // Type 17
+            MessageType::DataAmf0 => self.handle_data_amf0(payload).await?,       // Type 18
+            MessageType::DataAmf3 => self.handle_data_amf3(payload).await?,       // Type 15
+            MessageType::SharedObjectAmf0 => self.handle_shared_object_amf0(payload).await?, // Type 19
+            MessageType::SharedObjectAmf3 => self.handle_shared_object_amf3(payload).await?, // Type 16
+            MessageType::Aggregate => self.handle_aggregate(payload).await?,
             _ => {
                 debug!("Unhandled message type: {}", header.message_type);
             }
@@ -451,6 +473,225 @@ impl Connection {
     }
 
     // === Message Handlers ===
+
+    // Handle AMF3 commands (Type 17)
+    async fn handle_command_amf3(&self, payload: &[u8]) -> Result<()> {
+        debug!("Received AMF3 command message ({} bytes)", payload.len());
+        // AMF3 is more complex than AMF0 - for now just log and ignore
+        // You'd need an AMF3 parser to handle this properly
+        debug!(
+            "AMF3 command payload: {:02x?}",
+            &payload[..payload.len().min(50)]
+        );
+        Ok(())
+    }
+
+    // Handle AMF0 data messages (Type 18)
+    async fn handle_data_amf0(&self, payload: &[u8]) -> Result<()> {
+        debug!("Received AMF0 data message ({} bytes)", payload.len());
+
+        // Add hex dump for debugging (same as your command handler)
+        debug!("AMF0 data payload hex dump:");
+        for (i, chunk) in payload.chunks(16).enumerate() {
+            let hex: String = chunk
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii: String = chunk
+                .iter()
+                .map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' })
+                .collect();
+            debug!("{:04x}: {:<47} {}", i * 16, hex, ascii);
+        }
+
+        // Try to parse AMF0 values (same pattern as your command handler)
+        let mut cursor = &payload[..];
+        let mut values = Vec::new();
+        let mut value_index = 0;
+
+        while !cursor.is_empty() {
+            match rml_amf0::deserialize(&mut cursor) {
+                Ok(mut parsed_values) => {
+                    debug!(
+                        "Successfully parsed {} AMF0 data values starting at index {}",
+                        parsed_values.len(),
+                        value_index
+                    );
+                    for (i, value) in parsed_values.iter().enumerate() {
+                        debug!("  Data value {}: {:?}", value_index + i, value);
+                    }
+                    values.append(&mut parsed_values);
+                    value_index += parsed_values.len();
+                }
+                Err(e) => {
+                    debug!(
+                        "AMF0 data parsing failed at byte offset {}: {:?}",
+                        payload.len() - cursor.len(),
+                        e
+                    );
+                    debug!("Remaining bytes: {:?}", cursor);
+                    // For data messages, we can be more lenient and just log the error
+                    break;
+                }
+            }
+        }
+
+        if values.is_empty() {
+            debug!("No AMF0 data values parsed");
+            return Ok(());
+        }
+
+        debug!("Total AMF0 data values parsed: {}", values.len());
+        for (i, value) in values.iter().enumerate() {
+            debug!("Final data value {}: {:?}", i, value);
+        }
+
+        // Handle common data message types
+        if let Some(Amf0Value::Utf8String(command)) = values.get(0) {
+            match command.as_str() {
+                "@setDataFrame" => {
+                    info!("Received metadata frame");
+                    if let Some(Amf0Value::Utf8String(data_type)) = values.get(1) {
+                        debug!("Metadata type: {}", data_type);
+                        if data_type == "onMetaData" {
+                            info!("Received onMetaData - stream metadata");
+                            // This contains video/audio codec info, dimensions, etc.
+                        }
+                    }
+                }
+                "onMetaData" => {
+                    info!("Received onMetaData directly");
+                    // Sometimes sent directly without @setDataFrame wrapper
+                }
+                _ => {
+                    debug!("Unknown AMF0 data command: {}", command);
+                }
+            }
+        } else {
+            debug!("First AMF0 data value is not a string: {:?}", values.get(0));
+        }
+
+        Ok(())
+    }
+
+    // Handle AMF3 data messages (Type 15)
+    async fn handle_data_amf3(&self, payload: &[u8]) -> Result<()> {
+        debug!("Received AMF3 data message ({} bytes)", payload.len());
+        debug!(
+            "AMF3 data payload: {:02x?}",
+            &payload[..payload.len().min(50)]
+        );
+        // AMF3 parsing would be needed here
+        Ok(())
+    }
+
+    // Handle AMF0 shared objects (Type 19)
+    async fn handle_shared_object_amf0(&self, payload: &[u8]) -> Result<()> {
+        debug!(
+            "Received AMF0 shared object message ({} bytes)",
+            payload.len()
+        );
+        debug!(
+            "Shared object payload: {:02x?}",
+            &payload[..payload.len().min(50)]
+        );
+        // Shared objects are used for synchronized data between client/server
+        // For basic streaming, these can usually be ignored
+        Ok(())
+    }
+
+    // Handle AMF3 shared objects (Type 16)
+    async fn handle_shared_object_amf3(&self, payload: &[u8]) -> Result<()> {
+        debug!(
+            "Received AMF3 shared object message ({} bytes)",
+            payload.len()
+        );
+        debug!(
+            "Shared object payload: {:02x?}",
+            &payload[..payload.len().min(50)]
+        );
+        Ok(())
+    }
+
+    // Handle aggregate messages (Type 22)
+    async fn handle_aggregate(self: Arc<Self>, payload: &[u8]) -> Result<()> {
+        debug!("Received aggregate message ({} bytes)", payload.len());
+
+        // Aggregate messages contain multiple sub-messages
+        // Format: [previous_tag_size][tag_header][tag_data][previous_tag_size][tag_header][tag_data]...
+        let mut offset = 0;
+        let mut tag_count = 0;
+
+        while offset + 4 <= payload.len() {
+            // Skip previous tag size (4 bytes)
+            offset += 4;
+
+            if offset + 11 > payload.len() {
+                break;
+            }
+
+            // Read tag header (11 bytes)
+            let tag_type = payload[offset];
+            let data_size = u32::from_be_bytes([
+                0,
+                payload[offset + 1],
+                payload[offset + 2],
+                payload[offset + 3],
+            ]) as usize;
+            let timestamp = u32::from_be_bytes([
+                0,
+                payload[offset + 4],
+                payload[offset + 5],
+                payload[offset + 6],
+            ]);
+            let timestamp_extended = payload[offset + 7];
+            let stream_id = u32::from_be_bytes([
+                0,
+                payload[offset + 8],
+                payload[offset + 9],
+                payload[offset + 10],
+            ]);
+
+            offset += 11;
+
+            if offset + data_size > payload.len() {
+                break;
+            }
+
+            debug!(
+                "Aggregate tag {}: type={}, size={}, timestamp={}",
+                tag_count, tag_type, data_size, timestamp
+            );
+
+            let data = &payload[offset..offset + data_size];
+
+            // Process the tag data based on type
+            match tag_type {
+                8 => {
+                    debug!("Processing audio tag from aggregate");
+                    Arc::clone(&self).handle_audio(data).await?;
+                }
+                9 => {
+                    debug!("Processing video tag from aggregate");
+                    Arc::clone(&self).handle_video(data).await?;
+                }
+                18 => {
+                    debug!("Processing script data from aggregate");
+                    Arc::clone(&self).handle_data_amf0(data).await?;
+                }
+                _ => {
+                    debug!("Unknown tag type in aggregate: {}", tag_type);
+                }
+            }
+
+            offset += data_size;
+            tag_count += 1;
+        }
+
+        debug!("Processed {} tags from aggregate message", tag_count);
+        Ok(())
+    }
 
     async fn handle_set_chunk_size(self: Arc<Self>, payload: &[u8]) -> Result<()> {
         if payload.len() < 4 {
@@ -506,14 +747,124 @@ impl Connection {
         Ok(())
     }
 
+    async fn send_window_ack_size(&self, size: u32) -> Result<()> {
+        let data = size.to_be_bytes();
+        // Use chunk stream ID 2 for protocol control messages
+        let message = self.create_rtmp_message(
+            2, // chunk_stream_id for protocol control
+            MessageType::WindowAckSize as u8,
+            0, // message_stream_id
+            &data,
+        )?;
+
+        let mut stream = self.stream.lock().await;
+        stream.write_all(&message).await?;
+        stream.flush().await?;
+
+        debug!("Sent window ack size: {}", size);
+        Ok(())
+    }
+
+    async fn send_set_peer_bandwidth(&self, size: u32, limit_type: u8) -> Result<()> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&size.to_be_bytes());
+        data.push(limit_type);
+
+        // Use chunk stream ID 2 for protocol control messages
+        let message = self.create_rtmp_message(
+            2, // chunk_stream_id for protocol control
+            MessageType::SetPeerBandwidth as u8,
+            0, // message_stream_id
+            &data,
+        )?;
+
+        let mut stream = self.stream.lock().await;
+        stream.write_all(&message).await?;
+        stream.flush().await?;
+
+        debug!("Sent set peer bandwidth: {} (type: {})", size, limit_type);
+        Ok(())
+    }
+
+    async fn send_set_chunk_size(&self, size: u32) -> Result<()> {
+        let data = size.to_be_bytes();
+        // Use chunk stream ID 2 for protocol control messages
+        let message = self.create_rtmp_message(
+            2, // chunk_stream_id for protocol control
+            MessageType::SetChunkSize as u8,
+            0, // message_stream_id
+            &data,
+        )?;
+
+        let mut stream = self.stream.lock().await;
+        stream.write_all(&message).await?;
+        stream.flush().await?;
+
+        debug!("Sent set chunk size: {}", size);
+        Ok(())
+    }
+
     // async fn handle_command_amf0(self: Arc<Self>, payload: &[u8]) -> Result<()> {
     //     debug!("Parsing AMF0 command from {} bytes", payload.len());
+    //     // let fixed_payload = self.fix_ffmpeg_utf8_encoding(payload);
+    //     // let payload = &fixed_payload;
 
-    //     let values = rml_amf0::deserialize(&mut &payload[..])
-    //         .map_err(|e| RtmpError::Amf0(format!("AMF0 deserialization error: {:?}", e)))?;
+    //     // Add hex dump for debugging
+    //     debug!("AMF0 payload hex dump:");
+    //     for (i, chunk) in payload.chunks(16).enumerate() {
+    //         let hex: String = chunk
+    //             .iter()
+    //             .map(|b| format!("{:02x}", b))
+    //             .collect::<Vec<_>>()
+    //             .join(" ");
+    //         let ascii: String = chunk
+    //             .iter()
+    //             .map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' })
+    //             .collect();
+    //         debug!("{:04x}: {:<47} {}", i * 16, hex, ascii);
+    //     }
+
+    //     // Try to parse AMF0 values one by one
+    //     let mut cursor = &payload[..];
+    //     let mut values = Vec::new();
+    //     let mut value_index = 0;
+
+    //     while !cursor.is_empty() {
+    //         match rml_amf0::deserialize(&mut cursor) {
+    //             Ok(mut parsed_values) => {
+    //                 debug!(
+    //                     "Successfully parsed {} AMF0 values starting at index {}",
+    //                     parsed_values.len(),
+    //                     value_index
+    //                 );
+    //                 for (i, value) in parsed_values.iter().enumerate() {
+    //                     debug!("  Value {}: {:?}", value_index + i, value);
+    //                 }
+    //                 values.append(&mut parsed_values);
+    //                 value_index += parsed_values.len();
+    //             }
+    //             Err(e) => {
+    //                 error!(
+    //                     "AMF0 parsing failed at byte offset {}: {:?}",
+    //                     payload.len() - cursor.len(),
+    //                     e
+    //                 );
+    //                 debug!("Remaining bytes: {:?}", cursor);
+    //                 return Err(RtmpError::Amf0(format!(
+    //                     "AMF0 deserialization error: {:?}",
+    //                     e
+    //                 )));
+    //             }
+    //         }
+    //     }
 
     //     if values.is_empty() {
     //         return Err(RtmpError::Protocol("Empty AMF0 command".into()));
+    //     }
+
+    //     debug!("Total AMF0 values parsed: {}", values.len());
+    //     for (i, value) in values.iter().enumerate() {
+    //         debug!("Final value {}: {:?}", i, value);
     //     }
 
     //     if let Amf0Value::Utf8String(command) = &values[0] {
@@ -521,6 +872,10 @@ impl Connection {
     //         match command.as_str() {
     //             "connect" => {
     //                 info!("Processing connect command");
+    //                 // Debug the connect command parameters
+    //                 if values.len() > 1 {
+    //                     debug!("Connect command parameters: {:?}", &values[1..]);
+    //                 }
     //                 self.send_connect_response().await?;
     //             }
     //             "createStream" => {
@@ -533,6 +888,7 @@ impl Connection {
     //                     self.register_publisher(stream_key.clone()).await?;
     //                 } else {
     //                     warn!("Publish command missing stream key");
+    //                     debug!("Publish command values: {:?}", values);
     //                 }
     //             }
     //             "play" => {
@@ -541,6 +897,7 @@ impl Connection {
     //                     self.register_viewer(stream_key.clone()).await?;
     //                 } else {
     //                     warn!("Play command missing stream key");
+    //                     debug!("Play command values: {:?}", values);
     //                 }
     //             }
     //             _ => {
@@ -554,6 +911,7 @@ impl Connection {
     //     Ok(())
     // }
 
+    // Replace your handle_command_amf0 method with this more robust version
     async fn handle_command_amf0(self: Arc<Self>, payload: &[u8]) -> Result<()> {
         debug!("Parsing AMF0 command from {} bytes", payload.len());
 
@@ -572,7 +930,92 @@ impl Connection {
             debug!("{:04x}: {:<47} {}", i * 16, hex, ascii);
         }
 
-        // Try to parse AMF0 values one by one
+        // Robust AMF0 parsing - handle partial failures gracefully
+        let values = match self.parse_amf0_with_fallback(payload) {
+            Ok(vals) => vals,
+            Err(e) => {
+                error!("Critical AMF0 parsing failure: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        if values.is_empty() {
+            debug!("No AMF0 values parsed");
+            return Ok(());
+        }
+
+        debug!("Total AMF0 values parsed: {}", values.len());
+        for (i, value) in values.iter().enumerate() {
+            debug!("Final value {}: {:?}", i, value);
+        }
+
+        // Extract command name
+        let command = match values.get(0) {
+            Some(Amf0Value::Utf8String(cmd)) => cmd.clone(),
+            _ => {
+                debug!("First AMF0 value is not a string command");
+                return Ok(());
+            }
+        };
+
+        info!("Received AMF0 command: {}", command);
+
+        // Handle the command
+        match command.as_str() {
+            "connect" => {
+                info!("Processing connect command");
+                let params = &values[1..];
+                debug!("Connect command parameters: {:?}", params);
+                self.send_connect_response(params).await?;
+                // send_connect_response
+            }
+            "releaseStream" => {
+                let params = &values[1..];
+                self.handle_release_stream_command(params).await?;
+            }
+            "FCPublish" => {
+                let params = &values[1..];
+                self.handle_fc_publish_command(params).await?;
+            }
+            "FCUnpublish" => {
+                let params = &values[1..];
+                self.handle_fc_unpublish_command(params).await?;
+            }
+            "createStream" => {
+                info!("Processing createStream command");
+                let params = &values[1..];
+                self.handle_create_stream_command(params).await?;
+            }
+            "publish" => {
+                info!("Processing publish command");
+                let params = &values[1..];
+                self.handle_publish_command(params).await?;
+            }
+            "deleteStream" => {
+                let params = &values[1..];
+                self.handle_delete_stream_command(params).await?;
+            }
+            "closeStream" => {
+                info!("Processing closeStream command");
+                // Similar to deleteStream, cleanup resources
+                debug!("Stream closed by client");
+            }
+            "play" => {
+                info!("Processing play command");
+                let params = &values[1..];
+                // Handle play command for viewers
+                self.handle_play_command(params).await?;
+            }
+            _ => {
+                debug!("Unknown AMF0 command: {}", command);
+            }
+        }
+
+        Ok(())
+    }
+
+    // New robust parsing function that handles UTF-8 errors gracefully
+    fn parse_amf0_with_fallback(&self, payload: &[u8]) -> Result<Vec<Amf0Value>> {
         let mut cursor = &payload[..];
         let mut values = Vec::new();
         let mut value_index = 0;
@@ -592,156 +1035,648 @@ impl Connection {
                     value_index += parsed_values.len();
                 }
                 Err(e) => {
-                    error!(
+                    warn!(
                         "AMF0 parsing failed at byte offset {}: {:?}",
                         payload.len() - cursor.len(),
                         e
                     );
                     debug!("Remaining bytes: {:?}", cursor);
-                    return Err(RtmpError::Amf0(format!(
-                        "AMF0 deserialization error: {:?}",
-                        e
-                    )));
+
+                    // Try to recover by skipping problematic data
+                    if let Some(recovery_point) = self.find_next_amf0_value(&cursor) {
+                        warn!("Attempting recovery at offset {}", recovery_point);
+                        cursor = &cursor[recovery_point..];
+                        continue;
+                    } else {
+                        // If we can't recover and we have some values, return what we have
+                        if !values.is_empty() {
+                            warn!("Partial AMF0 parse - returning {} values", values.len());
+                            break;
+                        }
+                        // If no values were parsed, this is a critical error
+                        return Err(RtmpError::Amf0(format!(
+                            "AMF0 deserialization error: {:?}",
+                            e
+                        )));
+                    }
                 }
             }
         }
 
-        if values.is_empty() {
-            return Err(RtmpError::Protocol("Empty AMF0 command".into()));
-        }
+        Ok(values)
+    }
 
-        debug!("Total AMF0 values parsed: {}", values.len());
-        for (i, value) in values.iter().enumerate() {
-            debug!("Final value {}: {:?}", i, value);
-        }
+    // Helper function to find the next valid AMF0 type marker
+    fn find_next_amf0_value(&self, data: &[u8]) -> Option<usize> {
+        // AMF0 type markers
+        const AMF0_NUMBER: u8 = 0x00;
+        const AMF0_BOOLEAN: u8 = 0x01;
+        const AMF0_STRING: u8 = 0x02;
+        const AMF0_OBJECT: u8 = 0x03;
+        const AMF0_NULL: u8 = 0x05;
+        const AMF0_UNDEFINED: u8 = 0x06;
+        const AMF0_ARRAY: u8 = 0x08;
+        const AMF0_OBJECT_END: u8 = 0x09;
 
-        if let Amf0Value::Utf8String(command) = &values[0] {
-            info!("Received AMF0 command: {}", command);
-            match command.as_str() {
-                "connect" => {
-                    info!("Processing connect command");
-                    // Debug the connect command parameters
-                    if values.len() > 1 {
-                        debug!("Connect command parameters: {:?}", &values[1..]);
-                    }
-                    self.send_connect_response().await?;
-                }
-                "createStream" => {
-                    info!("Processing createStream command");
-                    self.send_create_stream_response().await?;
-                }
-                "publish" => {
-                    if let Some(Amf0Value::Utf8String(stream_key)) = values.get(3) {
-                        info!("Client wants to publish to stream: {}", stream_key);
-                        self.register_publisher(stream_key.clone()).await?;
-                    } else {
-                        warn!("Publish command missing stream key");
-                        debug!("Publish command values: {:?}", values);
+        for (i, &byte) in data.iter().enumerate() {
+            match byte {
+                AMF0_NUMBER | AMF0_BOOLEAN | AMF0_STRING | AMF0_OBJECT | AMF0_NULL
+                | AMF0_UNDEFINED | AMF0_ARRAY | AMF0_OBJECT_END => {
+                    if i > 0 {
+                        return Some(i);
                     }
                 }
-                "play" => {
-                    if let Some(Amf0Value::Utf8String(stream_key)) = values.get(3) {
-                        info!("Client wants to play stream: {}", stream_key);
-                        self.register_viewer(stream_key.clone()).await?;
-                    } else {
-                        warn!("Play command missing stream key");
-                        debug!("Play command values: {:?}", values);
-                    }
-                }
-                _ => {
-                    debug!("Unhandled AMF0 command: {}", command);
-                }
+                _ => {}
             }
-        } else {
-            warn!("First AMF0 value is not a string: {:?}", values[0]);
         }
-
-        Ok(())
+        None
     }
 
-    async fn send_create_stream_response(self: Arc<Self>) -> Result<()> {
-        let response = vec![
-            Amf0Value::Utf8String("_result".into()),
-            Amf0Value::Number(2.0), // Transaction ID
-            Amf0Value::Null,        // No properties
-            Amf0Value::Number(1.0), // Stream ID (1)
-        ];
+    async fn send_connect_response(self: Arc<Self>, params: &[Amf0Value]) -> Result<()> {
+        // Extract transaction ID from params (usually at index 0)
+        let transaction_id = match params.get(0) {
+            Some(Amf0Value::Number(id)) => *id,
+            _ => 1.0, // Default transaction ID
+        };
 
-        let data = serialize(&response)
-            .map_err(|e| RtmpError::Amf0(format!("serialize error: {:?}", e)))?;
-
-        // Create proper RTMP message
-        let message = self.create_rtmp_message(MessageType::CommandAmf0 as u8, 0, &data)?;
-
-        let mut stream = self.stream.lock().await;
-        stream.write_all(&message).await?;
-        stream.flush().await?;
-
-        info!("Sent createStream response");
-        Ok(())
-    }
-
-    async fn send_connect_response(self: Arc<Self>) -> Result<()> {
-        let props = Amf0Value::Object(
-            vec![
+        // Send _result response
+        let response_values = vec![
+            Amf0Value::Utf8String("_result".to_string()),
+            Amf0Value::Number(transaction_id),
+            Amf0Value::Object(std::collections::HashMap::from([
                 (
                     "fmsVer".to_string(),
-                    Amf0Value::Utf8String("FMS/3,5,7,7009".into()),
+                    Amf0Value::Utf8String("FMS/3,0,1,123".to_string()),
                 ),
                 ("capabilities".to_string(), Amf0Value::Number(31.0)),
-                ("mode".to_string(), Amf0Value::Number(1.0)),
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        let info = Amf0Value::Object(
-            vec![
-                ("level".to_string(), Amf0Value::Utf8String("status".into())),
+            ])),
+            Amf0Value::Object(std::collections::HashMap::from([
+                (
+                    "level".to_string(),
+                    Amf0Value::Utf8String("status".to_string()),
+                ),
                 (
                     "code".to_string(),
-                    Amf0Value::Utf8String("NetConnection.Connect.Success".into()),
+                    Amf0Value::Utf8String("NetConnection.Connect.Success".to_string()),
                 ),
                 (
                     "description".to_string(),
-                    Amf0Value::Utf8String("Connection succeeded.".into()),
+                    Amf0Value::Utf8String("Connection succeeded.".to_string()),
                 ),
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        let response = vec![
-            Amf0Value::Utf8String("_result".into()),
-            Amf0Value::Number(1.0), // Transaction ID
-            props,
-            info,
+                ("objectEncoding".to_string(), Amf0Value::Number(0.0)),
+            ])),
         ];
 
-        let data = serialize(&response)
-            .map_err(|e| RtmpError::Amf0(format!("serialize error: {:?}", e)))?;
-
-        // Create proper RTMP message
-        let message = self.create_rtmp_message(MessageType::CommandAmf0 as u8, 0, &data)?;
-
-        let mut stream = self.stream.lock().await;
-        stream.write_all(&message).await?;
-        stream.flush().await?;
-
+        self.send_amf0_command(3, &response_values).await?;
         info!("Sent connect response");
         Ok(())
     }
 
+    async fn handle_create_stream_command(self: Arc<Self>, params: &[Amf0Value]) -> Result<()> {
+        // Extract transaction ID from params
+        let transaction_id = match params.get(0) {
+            Some(Amf0Value::Number(id)) => *id,
+            _ => 2.0, // Default transaction ID
+        };
+
+        // Generate a new stream ID using atomic counter
+        let stream_id = self
+            .next_stream_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as f64;
+
+        let response_values = vec![
+            Amf0Value::Utf8String("_result".to_string()),
+            Amf0Value::Number(transaction_id),
+            Amf0Value::Null,
+            Amf0Value::Number(stream_id),
+        ];
+
+        self.send_amf0_command(3, &response_values).await?;
+        info!(
+            "Sent createStream response with stream ID: {} (transaction: {})",
+            stream_id, transaction_id
+        );
+        Ok(())
+    }
+
+    async fn handle_publish_command(self: Arc<Self>, params: &[Amf0Value]) -> Result<()> {
+        // Extract stream name from params
+        let stream_name = match params.get(1) {
+            Some(Amf0Value::Utf8String(name)) => name.clone(),
+            _ => {
+                return Err(RtmpError::Protocol(
+                    "Missing stream name in publish command".to_string(),
+                ))
+            }
+        };
+
+        // Extract publish type (optional)
+        let publish_type = match params.get(2) {
+            Some(Amf0Value::Utf8String(ptype)) => ptype.clone(),
+            _ => "live".to_string(), // Default to live
+        };
+
+        info!(
+            "Publishing stream: {} (type: {})",
+            stream_name, publish_type
+        );
+
+        // Send onStatus with NetStream.Publish.Start
+        let response_values = vec![
+            Amf0Value::Utf8String("onStatus".to_string()),
+            Amf0Value::Number(0.0), // Transaction ID
+            Amf0Value::Null,
+            Amf0Value::Object(std::collections::HashMap::from([
+                (
+                    "level".to_string(),
+                    Amf0Value::Utf8String("status".to_string()),
+                ),
+                (
+                    "code".to_string(),
+                    Amf0Value::Utf8String("NetStream.Publish.Start".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Amf0Value::Utf8String(format!("Started publishing stream '{}'.", stream_name)),
+                ),
+                (
+                    "details".to_string(),
+                    Amf0Value::Utf8String(stream_name.clone()),
+                ),
+            ])),
+        ];
+
+        Arc::clone(&self)
+            .register_publisher(stream_name.clone())
+            .await?;
+        self.send_amf0_command(3, &response_values).await?;
+        info!("Sent publish response for stream: {}", stream_name);
+        Ok(())
+    }
+
+    async fn handle_play_command(self: Arc<Self>, params: &[Amf0Value]) -> Result<()> {
+        info!("Processing play command");
+
+        let stream_name = if params.len() >= 3 {
+            match &params[2] {
+                Amf0Value::Utf8String(name) => Some(name.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(name) = stream_name {
+            info!("Client wants to play stream: {}", name);
+
+            // Send play response
+            Arc::clone(&self).register_viewer(name.clone()).await?;
+            // Arc::clone(&self).register_viewer(&name).await?;
+            self.send_play_response(&name).await?;
+        } else {
+            warn!("Play command missing stream name");
+        }
+
+        Ok(())
+    }
+
+    // Send play response
+    async fn send_play_response(self: Arc<Self>, stream_name: &str) -> Result<()> {
+        // Send onStatus with NetStream.Play.Start
+        let response_values = vec![
+            Amf0Value::Utf8String("onStatus".to_string()),
+            Amf0Value::Number(0.0),
+            Amf0Value::Null,
+            Amf0Value::Object(std::collections::HashMap::from([
+                (
+                    "level".to_string(),
+                    Amf0Value::Utf8String("status".to_string()),
+                ),
+                (
+                    "code".to_string(),
+                    Amf0Value::Utf8String("NetStream.Play.Start".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Amf0Value::Utf8String(format!("Started playing stream '{}'.", stream_name)),
+                ),
+                (
+                    "details".to_string(),
+                    Amf0Value::Utf8String(stream_name.to_string()),
+                ),
+            ])),
+        ];
+
+        self.send_amf0_command(3, &response_values).await?;
+        info!("Sent play response for stream: {}", stream_name);
+        Ok(())
+    }
+
+    async fn handle_fc_publish_command(self: Arc<Self>, params: &[Amf0Value]) -> Result<()> {
+        info!("Processing FCPublish command");
+
+        // Extract stream name from parameters
+        let stream_name = if params.len() >= 3 {
+            match &params[2] {
+                Amf0Value::Utf8String(name) => Some(name.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(name) = stream_name {
+            info!("FCPublish for stream: {}", name);
+
+            // Send FCPublish response (onFCPublish)
+            self.send_fc_publish_response(&name).await?;
+        } else {
+            warn!("FCPublish command missing stream name");
+        }
+
+        Ok(())
+    }
+
+    // Handle releaseStream command - releases a stream for publishing
+    async fn handle_release_stream_command(&self, params: &[Amf0Value]) -> Result<()> {
+        info!("Processing releaseStream command");
+
+        // Extract stream name from parameters
+        let stream_name = if params.len() >= 3 {
+            match &params[2] {
+                Amf0Value::Utf8String(name) => Some(name.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(name) = stream_name {
+            info!("Releasing stream: {}", name);
+
+            // In a full implementation, you'd remove the stream from active streams
+            // For now, just acknowledge the command
+            debug!("Stream '{}' released (no-op in this implementation)", name);
+        } else {
+            warn!("releaseStream command missing stream name");
+        }
+
+        // releaseStream typically doesn't send a response
+        Ok(())
+    }
+
+    // Handle FCUnpublish command - counterpart to FCPublish
+    async fn handle_fc_unpublish_command(self: Arc<Self>, params: &[Amf0Value]) -> Result<()> {
+        info!("Processing FCUnpublish command");
+
+        let stream_name = if params.len() >= 3 {
+            match &params[2] {
+                Amf0Value::Utf8String(name) => Some(name.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(name) = stream_name {
+            info!("FCUnpublish for stream: {}", name);
+
+            // Send FCUnpublish response
+            self.send_fc_unpublish_response(&name).await?;
+        } else {
+            warn!("FCUnpublish command missing stream name");
+        }
+
+        Ok(())
+    }
+
+    // Handle deleteStream command
+    async fn handle_delete_stream_command(&self, params: &[Amf0Value]) -> Result<()> {
+        info!("Processing deleteStream command");
+
+        let stream_id = if params.len() >= 3 {
+            match &params[2] {
+                Amf0Value::Number(id) => Some(*id as u32),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(id) = stream_id {
+            info!("Deleting stream ID: {}", id);
+            // In a full implementation, clean up the stream resources
+        } else {
+            warn!("deleteStream command missing stream ID");
+        }
+
+        // deleteStream typically doesn't send a response
+        Ok(())
+    }
+
+    // Send FCPublish response
+    async fn send_fc_publish_response(self: Arc<Self>, stream_name: &str) -> Result<()> {
+        let response_values = vec![
+            Amf0Value::Utf8String("onFCPublish".to_string()),
+            Amf0Value::Number(0.0), // Transaction ID
+            Amf0Value::Null,
+            Amf0Value::Object(std::collections::HashMap::from([
+                (
+                    "code".to_string(),
+                    Amf0Value::Utf8String("NetStream.Publish.Start".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Amf0Value::Utf8String(format!("Started publishing stream '{}'.", stream_name)),
+                ),
+            ])),
+        ];
+
+        self.send_amf0_command(3, &response_values).await?;
+        debug!("Sent FCPublish response for stream: {}", stream_name);
+        Ok(())
+    }
+
+    // Send FCUnpublish response
+    async fn send_fc_unpublish_response(self: Arc<Self>, stream_name: &str) -> Result<()> {
+        let response_values = vec![
+            Amf0Value::Utf8String("onFCUnpublish".to_string()),
+            Amf0Value::Number(0.0), // Transaction ID
+            Amf0Value::Null,
+            Amf0Value::Object(std::collections::HashMap::from([
+                (
+                    "code".to_string(),
+                    Amf0Value::Utf8String("NetStream.Unpublish.Success".to_string()),
+                ),
+                (
+                    "description".to_string(),
+                    Amf0Value::Utf8String(format!("Stopped publishing stream '{}'.", stream_name)),
+                ),
+            ])),
+        ];
+
+        self.send_amf0_command(3, &response_values).await?;
+        debug!("Sent FCUnpublish response for stream: {}", stream_name);
+        Ok(())
+    }
+
+    // Updated command handler that includes all these commands
+    // async fn handle_command_amf0(&self, payload: &[u8]) -> Result<()> {
+    //     // ... your existing parsing code ...
+
+    //     // Handle the command (add these cases to your existing match statement)
+    //     match command.as_str() {
+    //         "connect" => {
+    //             info!("Processing connect command");
+    //             let params = &values[1..];
+    //             debug!("Connect command parameters: {:?}", params);
+    //             self.handle_connect_command(params).await?;
+    //         }
+    //         "releaseStream" => {
+    //             let params = &values[1..];
+    //             self.handle_release_stream_command(params).await?;
+    //         }
+    //         "FCPublish" => {
+    //             let params = &values[1..];
+    //             self.handle_fc_publish_command(params).await?;
+    //         }
+    //         "FCUnpublish" => {
+    //             let params = &values[1..];
+    //             self.handle_fc_unpublish_command(params).await?;
+    //         }
+    //         "createStream" => {
+    //             info!("Processing createStream command");
+    //             self.handle_create_stream_command().await?;
+    //         }
+    //         "publish" => {
+    //             info!("Processing publish command");
+    //             let params = &values[1..];
+    //             self.handle_publish_command(params).await?;
+    //         }
+    //         "deleteStream" => {
+    //             let params = &values[1..];
+    //             self.handle_delete_stream_command(params).await?;
+    //         }
+    //         "closeStream" => {
+    //             info!("Processing closeStream command");
+    //             // Similar to deleteStream, cleanup resources
+    //             debug!("Stream closed by client");
+    //         }
+    //         "play" => {
+    //             info!("Processing play command");
+    //             let params = &values[1..];
+    //             // Handle play command for viewers
+    //             self.handle_play_command(params).await?;
+    //         }
+    //         _ => {
+    //             debug!("Unknown AMF0 command: {}", command);
+    //         }
+    //     }
+
+    //     Ok(())
+    // }
+
+    // Bonus: Handle play command for viewers
+    // async fn handle_play_command(&self, params: &[Amf0Value]) -> Result<()> {
+    //     info!("Processing play command");
+
+    //     let stream_name = if params.len() >= 3 {
+    //         match &params[2] {
+    //             Amf0Value::Utf8String(name) => Some(name.clone()),
+    //             _ => None,
+    //         }
+    //     } else {
+    //         None
+    //     };
+
+    //     if let Some(name) = stream_name {
+    //         info!("Client wants to play stream: {}", name);
+
+    //         // Send play response
+    //         self.send_play_response(&name).await?;
+    //     } else {
+    //         warn!("Play command missing stream name");
+    //     }
+
+    //     Ok(())
+    // }
+
+    // // Send play response
+    // async fn send_play_response(&self, stream_name: &str) -> Result<()> {
+    //     // Send onStatus with NetStream.Play.Start
+    //     let response_values = vec![
+    //         Amf0Value::Utf8String("onStatus".to_string()),
+    //         Amf0Value::Number(0.0),
+    //         Amf0Value::Null,
+    //         Amf0Value::Object(std::collections::HashMap::from([
+    //             (
+    //                 "level".to_string(),
+    //                 Amf0Value::Utf8String("status".to_string()),
+    //             ),
+    //             (
+    //                 "code".to_string(),
+    //                 Amf0Value::Utf8String("NetStream.Play.Start".to_string()),
+    //             ),
+    //             (
+    //                 "description".to_string(),
+    //                 Amf0Value::Utf8String(format!("Started playing stream '{}'.", stream_name)),
+    //             ),
+    //             (
+    //                 "details".to_string(),
+    //                 Amf0Value::Utf8String(stream_name.to_string()),
+    //             ),
+    //         ])),
+    //     ];
+
+    //     self.send_amf0_command(3, &response_values).await?;
+    //     info!("Sent play response for stream: {}", stream_name);
+    //     Ok(())
+    // }
+
+    // async fn send_create_stream_response(self: Arc<Self>) -> Result<()> {
+    //     let response = vec![
+    //         Amf0Value::Utf8String("_result".into()),
+    //         Amf0Value::Number(2.0), // Transaction ID
+    //         Amf0Value::Null,        // No properties
+    //         Amf0Value::Number(1.0), // Stream ID (1)
+    //     ];
+
+    //     let data = serialize(&response)
+    //         .map_err(|e| RtmpError::Amf0(format!("serialize error: {:?}", e)))?;
+
+    //     // Create proper RTMP message using dynamic function
+    //     // Use chunk stream ID 3 for command messages
+    //     let message = self.create_rtmp_message(
+    //         3, // chunk_stream_id for command messages
+    //         MessageType::CommandAmf0 as u8,
+    //         0, // message_stream_id
+    //         &data,
+    //     )?;
+
+    //     let mut stream = self.stream.lock().await;
+    //     stream.write_all(&message).await?;
+    //     stream.flush().await?;
+
+    //     info!("Sent createStream response");
+    //     Ok(())
+    // }
+
+    // async fn send_connect_response(self: Arc<Self>) -> Result<()> {
+    //     // Send Window Acknowledgement Size (5MB)
+    //     self.send_window_ack_size(5000000).await?;
+
+    //     // Send Set Peer Bandwidth (5MB, Dynamic)
+    //     self.send_set_peer_bandwidth(5000000, 2).await?;
+
+    //     // Send Set Chunk Size (4096 bytes)
+    //     self.send_set_chunk_size(4096).await?;
+
+    //     //  send the _result AMF0 response
+    //     let props = Amf0Value::Object(
+    //         vec![
+    //             (
+    //                 "fmsVer".to_string(),
+    //                 Amf0Value::Utf8String("FMS/3,5,7,7009".into()),
+    //             ),
+    //             ("capabilities".to_string(), Amf0Value::Number(31.0)),
+    //             ("mode".to_string(), Amf0Value::Number(1.0)),
+    //         ]
+    //         .into_iter()
+    //         .collect(),
+    //     );
+
+    //     let info = Amf0Value::Object(
+    //         vec![
+    //             ("level".to_string(), Amf0Value::Utf8String("status".into())),
+    //             (
+    //                 "code".to_string(),
+    //                 Amf0Value::Utf8String("NetConnection.Connect.Success".into()),
+    //             ),
+    //             (
+    //                 "description".to_string(),
+    //                 Amf0Value::Utf8String("Connection succeeded.".into()),
+    //             ),
+    //         ]
+    //         .into_iter()
+    //         .collect(),
+    //     );
+
+    //     let response = vec![
+    //         Amf0Value::Utf8String("_result".into()),
+    //         Amf0Value::Number(1.0), // Transaction ID
+    //         props,
+    //         info,
+    //     ];
+
+    //     let data = serialize(&response)
+    //         .map_err(|e| RtmpError::Amf0(format!("serialize error: {:?}", e)))?;
+
+    //     // Create proper RTMP message
+    //     let message = self.create_rtmp_message(3, MessageType::CommandAmf0 as u8, 0, &data)?;
+
+    //     let mut stream = self.stream.lock().await;
+    //     stream.write_all(&message).await?;
+    //     stream.flush().await?;
+
+    //     info!("Sent connect response");
+    //     Ok(())
+    // }
+
+    // fn create_rtmp_message(
+    //     &self,
+    //     message_type: u8,
+    //     stream_id: u32,
+    //     payload: &[u8],
+    // ) -> Result<Vec<u8>> {
+    //     let mut message = Vec::new();
+
+    //     // Basic header (format 0, chunk stream ID 3)
+    //     message.push(0x03); // Format 0, CSID 3
+
+    //     // Message header (11 bytes for format 0)
+    //     // Timestamp (3 bytes) - using 0 for now
+    //     message.extend_from_slice(&[0, 0, 0]);
+
+    //     // Message length (3 bytes)
+    //     let length = payload.len() as u32;
+    //     message.extend_from_slice(&[(length >> 16) as u8, (length >> 8) as u8, length as u8]);
+
+    //     // Message type (1 byte)
+    //     message.push(message_type);
+
+    //     // Stream ID (4 bytes, little endian)
+    //     message.extend_from_slice(&stream_id.to_le_bytes());
+
+    //     // Payload
+    //     message.extend_from_slice(payload);
+
+    //     Ok(message)
+    // }
+
     fn create_rtmp_message(
         &self,
+        chunk_stream_id: u32,
         message_type: u8,
-        stream_id: u32,
+        message_stream_id: u32,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
         let mut message = Vec::new();
 
-        // Basic header (format 0, chunk stream ID 3)
-        message.push(0x03); // Format 0, CSID 3
+        // Basic header (format 0, dynamic chunk stream ID)
+        if chunk_stream_id <= 63 {
+            // Single byte basic header
+            message.push(chunk_stream_id as u8);
+        } else if chunk_stream_id <= 319 {
+            // Two byte basic header
+            message.push(0); // Format 0, CSID = 0 (indicates 2-byte form)
+            message.push((chunk_stream_id - 64) as u8);
+        } else {
+            // Three byte basic header
+            message.push(1); // Format 0, CSID = 1 (indicates 3-byte form)
+            let csid_minus_64 = chunk_stream_id - 64;
+            message.push((csid_minus_64 & 0xFF) as u8);
+            message.push(((csid_minus_64 >> 8) & 0xFF) as u8);
+        }
 
         // Message header (11 bytes for format 0)
         // Timestamp (3 bytes) - using 0 for now
@@ -754,13 +1689,36 @@ impl Connection {
         // Message type (1 byte)
         message.push(message_type);
 
-        // Stream ID (4 bytes, little endian)
-        message.extend_from_slice(&stream_id.to_le_bytes());
+        // Message Stream ID (4 bytes, little endian)
+        message.extend_from_slice(&message_stream_id.to_le_bytes());
 
         // Payload
         message.extend_from_slice(payload);
 
         Ok(message)
+    }
+
+    async fn send_amf0_command(
+        self: Arc<Self>,
+        chunk_stream_id: u32,
+        values: &[Amf0Value],
+    ) -> Result<()> {
+        // Serialize AMF0 values to payload
+        let payload = serialize(&values.to_vec()).unwrap();
+
+        // Use the dynamic create_rtmp_message function
+        let message_type = 20; // AMF0 Command Message
+        let message_stream_id = 0; // Message stream ID (usually 0 for control messages)
+
+        let rtmp_message =
+            self.create_rtmp_message(chunk_stream_id, message_type, message_stream_id, &payload)?;
+
+        // Send the message using Arc<Mutex<>>
+        let mut stream = self.stream.lock().await;
+        stream.write_all(&rtmp_message).await?;
+        stream.flush().await?;
+
+        Ok(())
     }
 
     async fn handle_audio(self: Arc<Self>, payload: &[u8]) -> Result<()> {
@@ -867,7 +1825,7 @@ impl Connection {
         let data = serialize(&response)
             .map_err(|e| RtmpError::Amf0(format!("serialize error: {:?}", e)))?;
 
-        let message = self.create_rtmp_message(MessageType::CommandAmf0 as u8, 1, &data)?;
+        let message = self.create_rtmp_message(3, MessageType::CommandAmf0 as u8, 1, &data)?;
 
         let mut stream = self.stream.lock().await;
         stream.write_all(&message).await?;

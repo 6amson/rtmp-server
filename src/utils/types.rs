@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU32};
 
 #[derive(Parser)]
 #[command(name = "rtmp-server")]
@@ -74,7 +75,7 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MessageType {
     SetChunkSize = 1,
     Abort = 2,
@@ -110,6 +111,7 @@ pub struct Connection {
     pub state: Arc<Mutex<ConnectionState>>,
     pub session: Arc<Mutex<Option<Session>>>,
     pub stream_manager: Arc<RwLock<StreamManager>>,
+    pub next_stream_id: AtomicU32,
 }
 
 #[derive(Debug, Clone)]
